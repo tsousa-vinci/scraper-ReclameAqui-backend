@@ -72,7 +72,7 @@ class AllCompanies(mongoengine.Document):
     # Interações
     hasReply = mongoengine.BooleanField()
     lastReplyOrigin = mongoengine.StringField()
-    interactions = mongoengine.IntField()
+    interactions = mongoengine.ListField()  # Lista de dicts com histórico de interações
     
     # Moderação
     inModeration = mongoengine.BooleanField()
@@ -107,13 +107,13 @@ class AllCompanies(mongoengine.Document):
     url = mongoengine.StringField()
     ip = mongoengine.StringField()
     
-    # Campos adicionais (JSON)
+    
     additionalFields = mongoengine.DictField()
-    additionalInfo = mongoengine.DictField()
+    additionalInfo = mongoengine.StringField()  # Pode ser string vazia ou texto
     address = mongoengine.DictField()
     phones = mongoengine.ListField()
     files = mongoengine.ListField()
-    companyIndexes = mongoengine.ListField()
+    companyIndexes = mongoengine.ListField()  # Lista de strings (JSON serializado)
     complainMediaInfos = mongoengine.ListField()
     raFormsAnswer = mongoengine.DictField()
     
@@ -355,7 +355,7 @@ class AllCompanies(mongoengine.Document):
             # Interações
             'hasReply': safe_convert_bool(row.get('hasReply')),
             'lastReplyOrigin': safe_convert_str(row.get('lastReplyOrigin')),
-            'interactions': safe_convert_int(row.get('interactions')),
+            # interactions é tratado como campo complexo (lista) abaixo
             
             # Moderação
             'inModeration': safe_convert_bool(row.get('inModeration')),
@@ -396,20 +396,49 @@ class AllCompanies(mongoengine.Document):
             'company_name': safe_convert_str(row.get('company_name')),
         }
         
-        # Campos complexos (listas e dicts)
-        for field in ['additionalFields', 'additionalInfo', 'address', 'raFormsAnswer']:
-            val = row.get(field)
-            if pd.notna(val) and val is not None:
-                doc_data[field] = val if isinstance(val, dict) else {}
-            else:
-                doc_data[field] = None
+        # Campos complexos - tratamento específico por tipo
         
-        for field in ['phones', 'files', 'companyIndexes', 'complainMediaInfos']:
+        # additionalInfo é string, não dict
+        val = row.get('additionalInfo')
+        if pd.notna(val) and val is not None and val != '':
+            doc_data['additionalInfo'] = safe_convert_str(val)
+        
+        # Dicts
+        for field in ['additionalFields', 'address', 'raFormsAnswer']:
             val = row.get(field)
             if pd.notna(val) and val is not None:
-                doc_data[field] = val if isinstance(val, list) else []
-            else:
-                doc_data[field] = None
+                if isinstance(val, dict):
+                    # Só adiciona se não for dict vazio
+                    if val:
+                        doc_data[field] = val
+                elif isinstance(val, str):
+                    # Tentar parsear JSON se for string
+                    try:
+                        import json
+                        parsed = json.loads(val)
+                        if parsed:
+                            doc_data[field] = parsed
+                    except:
+                        pass
+        
+        # Listas (podem conter dicts, strings, etc)
+        # interactions é especialmente importante - histórico de respostas/interações
+        for field in ['interactions', 'phones', 'files', 'companyIndexes', 'complainMediaInfos']:
+            val = row.get(field)
+            if pd.notna(val) and val is not None:
+                if isinstance(val, list):
+                    # Só adiciona se não for lista vazia
+                    if val:
+                        doc_data[field] = val
+                elif isinstance(val, str):
+                    # Tentar parsear JSON se for string
+                    try:
+                        import json
+                        parsed = json.loads(val)
+                        if isinstance(parsed, list) and parsed:
+                            doc_data[field] = parsed
+                    except:
+                        pass
         
         # Remover campos None (mongoengine não aceita None em update)
         doc_data = {k: v for k, v in doc_data.items() if v is not None}
