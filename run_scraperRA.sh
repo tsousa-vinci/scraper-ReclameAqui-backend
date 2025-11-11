@@ -37,7 +37,7 @@ cd "$SHELL_DIR/src"
 
 {
     echo "=== Inicio de ejecución del script Python (módulo) ==="
-    python3 -m Spread.run_scraper 2>&1
+    python3 -m ReclameAqui.run_scraper 2>&1
     echo "=== Fin de ejecución del script Python ==="
     echo "Código de salida: $?"
 } | tee -a "$LOG_PATH"

@@ -1,6 +1,8 @@
 import mongoengine
 import sys
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 # Adicionar o diretório src ao path para importar os módulos
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -8,6 +10,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.db_connection import mongoDBConnection
 from db.models.AllCompanies import AllCompanies
 from ReclameAqui.collector import get_all_companies_from_s3
+
 
 
 def main():

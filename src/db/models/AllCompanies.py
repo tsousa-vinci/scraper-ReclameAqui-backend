@@ -135,6 +135,13 @@ class AllCompanies(mongoengine.Document):
     }
 
     @classmethod
+    def _get_collection(cls):
+        """
+        Retorna a coleção PyMongo para operações bulk.
+        """
+        return cls._get_db()[cls._meta['collection']]
+
+    @classmethod
     def get_last_updated_date(cls):
         """
         Retorna a data de criação do registro mais recente no MongoDB.
@@ -189,53 +196,83 @@ class AllCompanies(mongoengine.Document):
                         'total_processed': 0
                     }
             
-            # 2. Processar registros em lotes
-            batch_size = 1000
+            # 2. Processar registros em lotes usando bulk operations (MUITO MAIS RÁPIDO!)
+            batch_size = 5000  # Aumentado para 5000 para melhor performance
             total_records = len(df_to_process)
             new_records = 0
-            updated_records = 0
             errors = 0
             
             print(f"📊 Processando {total_records} registros em lotes de {batch_size}...")
+            print("⚡ Usando bulk operations para máxima performance...")
+            
+            from pymongo import ReplaceOne
+            import time
+            
+            start_time = time.time()
             
             for i in range(0, total_records, batch_size):
                 batch_df = df_to_process.iloc[i:i+batch_size]
+                
+                # Preparar todas as operações do lote
+                bulk_operations = []
                 
                 for idx, row in batch_df.iterrows():
                     try:
                         # Converter dados do DataFrame para dict
                         doc_data = cls._prepare_document_data(row)
                         
-                        # Usar update_one com upsert=True para inserir ou atualizar
-                        result = cls.objects(id=doc_data['id']).update_one(
-                            upsert=True,
-                            **doc_data
-                        )
+                        if 'id' not in doc_data:
+                            errors += 1
+                            continue
                         
-                        if result == 0:
-                            updated_records += 1
-                        else:
-                            new_records += 1
-                            
+                        # Usar ReplaceOne (mais rápido que UpdateOne para docs completos)
+                        operation = ReplaceOne(
+                            {'_id': doc_data['id']},   # Filtro
+                            doc_data,                   # Documento completo
+                            upsert=True                 # Criar se não existir
+                        )
+                        bulk_operations.append(operation)
+                        
                     except Exception as e:
                         errors += 1
                         if errors <= 5:  # Mostrar apenas os primeiros 5 erros
-                            print(f"❌ Erro no registro {row.get('id', 'unknown')}: {e}")
+                            print(f"❌ Erro ao preparar registro {row.get('id', 'unknown')}: {e}")
                 
-                # Mostrar progresso
+                # Executar todas as operações do lote de uma vez
+                if bulk_operations:
+                    try:
+                        # ordered=False permite execução paralela (mais rápido)
+                        result = cls._get_collection().bulk_write(bulk_operations, ordered=False)
+                        new_records += result.upserted_count + result.inserted_count + result.modified_count
+                        
+                    except Exception as e:
+                        errors += len(bulk_operations)
+                        print(f"❌ Erro no bulk write: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    # Debug: se não há operações, algo está errado
+                    if i == 0:  # Apenas no primeiro lote
+                        print(f"⚠️ Aviso: Nenhuma operação preparada no lote {i//batch_size + 1}")
+                
+                # Mostrar progresso com tempo estimado
                 processed = min(i + batch_size, total_records)
-                print(f"   Processados: {processed}/{total_records} ({100*processed/total_records:.1f}%)")
+                elapsed = time.time() - start_time
+                rate = processed / elapsed if elapsed > 0 else 0
+                remaining = (total_records - processed) / rate if rate > 0 else 0
+                
+                print(f"   Processados: {processed}/{total_records} ({100*processed/total_records:.1f}%) "
+                      f"- {int(rate)} reg/s - ETA: {int(remaining)}s - {new_records} inseridos")
             
             stats = {
                 'new_records': new_records,
-                'updated_records': updated_records,
+                'updated_records': 0,  # bulk_write não diferencia updates de inserts facilmente
                 'errors': errors,
                 'total_processed': total_records
             }
             
-            print(f"\n✅ Atualização concluída!")
-            print(f"   📥 Novos registros: {new_records}")
-            print(f"   🔄 Registros atualizados: {updated_records}")
+            print("\n✅ Atualização concluída!")
+            print(f"   📥 Novos registros inseridos/atualizados: {new_records}")
             print(f"   ❌ Erros: {errors}")
             
             return stats
@@ -400,45 +437,66 @@ class AllCompanies(mongoengine.Document):
         
         # additionalInfo é string, não dict
         val = row.get('additionalInfo')
-        if pd.notna(val) and val is not None and val != '':
-            doc_data['additionalInfo'] = safe_convert_str(val)
+        try:
+            if pd.notna(val) and str(val).strip() != '':
+                doc_data['additionalInfo'] = safe_convert_str(val)
+        except (ValueError, TypeError):
+            pass
         
         # Dicts
         for field in ['additionalFields', 'address', 'raFormsAnswer']:
-            val = row.get(field)
-            if pd.notna(val) and val is not None:
+            try:
+                val = row.get(field)
+                if val is None:
+                    continue
+                    
+                # Verificar se não é NaN usando isinstance
+                if isinstance(val, float) and pd.isna(val):
+                    continue
+                    
                 if isinstance(val, dict):
                     # Só adiciona se não for dict vazio
                     if val:
                         doc_data[field] = val
-                elif isinstance(val, str):
+                elif isinstance(val, str) and val.strip():
                     # Tentar parsear JSON se for string
                     try:
                         import json
                         parsed = json.loads(val)
                         if parsed:
                             doc_data[field] = parsed
-                    except:
+                    except (json.JSONDecodeError, ValueError):
                         pass
+            except (ValueError, TypeError):
+                pass
         
         # Listas (podem conter dicts, strings, etc)
         # interactions é especialmente importante - histórico de respostas/interações
         for field in ['interactions', 'phones', 'files', 'companyIndexes', 'complainMediaInfos']:
-            val = row.get(field)
-            if pd.notna(val) and val is not None:
+            try:
+                val = row.get(field)
+                if val is None:
+                    continue
+                
+                # Verificar se não é NaN usando isinstance
+                if isinstance(val, float) and pd.isna(val):
+                    continue
+                
                 if isinstance(val, list):
                     # Só adiciona se não for lista vazia
-                    if val:
+                    if len(val) > 0:
                         doc_data[field] = val
-                elif isinstance(val, str):
+                elif isinstance(val, str) and val.strip():
                     # Tentar parsear JSON se for string
                     try:
                         import json
                         parsed = json.loads(val)
-                        if isinstance(parsed, list) and parsed:
+                        if isinstance(parsed, list) and len(parsed) > 0:
                             doc_data[field] = parsed
-                    except:
+                    except (json.JSONDecodeError, ValueError):
                         pass
+            except (ValueError, TypeError):
+                pass
         
         # Remover campos None (mongoengine não aceita None em update)
         doc_data = {k: v for k, v in doc_data.items() if v is not None}
