@@ -157,44 +157,59 @@ class AllCompanies(mongoengine.Document):
             return None
 
     @classmethod
-    def incremental_update_from_df(cls, df):
+    def incremental_update_from_df(cls, df, force_full_sync=False):
         """
-        Atualiza incrementalmente o MongoDB com novos dados do DataFrame.
+        Atualiza o MongoDB com dados do DataFrame usando comparação por ID.
         
         Estratégia:
-        1. Busca a data mais recente no MongoDB
-        2. Filtra apenas registros novos ou mais recentes do DataFrame
-        3. Faz bulk upsert (insere novos, atualiza existentes)
+        1. Busca todos os IDs existentes no MongoDB usando aggregation (evita limite de 16MB)
+        2. Compara com IDs do DataFrame
+        3. Insere apenas registros que não existem (baseado em ID)
         
         Args:
             df (pd.DataFrame): DataFrame com todos os dados do S3
+            force_full_sync (bool): Se True, processa todos os registros (upsert)
             
         Returns:
             dict: Estatísticas da atualização
         """
-        print("🔄 Iniciando atualização incremental...")
+        print("🔄 Iniciando atualização baseada em ID...")
         
         try:
-            # 1. Verificar última data no MongoDB
-            last_date = cls.get_last_updated_date()
+            # 1. Buscar IDs existentes no MongoDB usando cursor (evita limite de 16MB do distinct)
+            print("📊 Buscando IDs existentes no MongoDB...")
             
-            if last_date is None:
-                print("📦 MongoDB vazio. Inserindo todos os registros...")
+            # Usar aggregation com allowDiskUse para evitar limite de memória
+            pipeline = [
+                {"$project": {"_id": 1}},
+            ]
+            cursor = cls._get_collection().aggregate(pipeline, allowDiskUse=True)
+            existing_ids = set(doc['_id'] for doc in cursor)
+            print(f"   IDs no MongoDB: {len(existing_ids):,}")
+            
+            # 2. Identificar IDs que estão no S3 mas não no MongoDB
+            s3_ids = set(df['id'].dropna().unique())
+            print(f"   IDs no S3: {len(s3_ids):,}")
+            
+            missing_ids = s3_ids - existing_ids
+            print(f"🆕 {len(missing_ids):,} registros novos encontrados (IDs que faltam no MongoDB)")
+            
+            if len(missing_ids) == 0 and not force_full_sync:
+                print("✅ Base já está atualizada!")
+                return {
+                    'new_records': 0,
+                    'updated_records': 0,
+                    'errors': 0,
+                    'total_processed': 0
+                }
+            
+            # 3. Filtrar apenas registros que precisam ser inseridos
+            if force_full_sync:
                 df_to_process = df.copy()
+                print(f"⚠️ Full sync ativado - processando todos os {len(df_to_process):,} registros")
             else:
-                print(f"📅 Última data no MongoDB: {last_date}")
-                # Filtrar apenas registros mais recentes
-                df_to_process = df[pd.to_datetime(df['created']) > last_date].copy()
-                print(f"🆕 {len(df_to_process)} novos registros encontrados")
-                
-                if len(df_to_process) == 0:
-                    print("✅ Base já está atualizada!")
-                    return {
-                        'new_records': 0,
-                        'updated_records': 0,
-                        'errors': 0,
-                        'total_processed': 0
-                    }
+                df_to_process = df[df['id'].isin(missing_ids)].copy()
+                print(f"📋 Processando {len(df_to_process):,} registros faltantes")
             
             # 2. Processar registros em lotes usando bulk operations (MUITO MAIS RÁPIDO!)
             batch_size = 5000  # Aumentado para 5000 para melhor performance
@@ -287,9 +302,34 @@ class AllCompanies(mongoengine.Document):
         Prepara dados de uma linha do DataFrame para inserção no MongoDB.
         Converte tipos e trata valores nulos.
         """
+        import numpy as np
+        
+        def is_null_or_empty(val):
+            """Verifica se o valor é nulo, NaN ou array/lista vazio de forma segura"""
+            if val is None:
+                return True
+            # Verificar numpy array primeiro (antes de pd.isna que falha com arrays vazios)
+            if isinstance(val, np.ndarray):
+                return val.size == 0
+            # Verificar lista vazia (pd.isna em lista vazia retorna array vazio que causa erro)
+            if isinstance(val, list):
+                return len(val) == 0
+            # Verificar dict vazio
+            if isinstance(val, dict):
+                return len(val) == 0
+            # Agora é seguro usar pd.isna para tipos escalares
+            try:
+                result = pd.isna(val)
+                # pd.isna pode retornar array em alguns casos, verificar
+                if isinstance(result, np.ndarray):
+                    return result.size == 0 or (result.size > 0 and result.all())
+                return bool(result)
+            except (ValueError, TypeError):
+                return False
+        
         def safe_convert_datetime(val):
             """Converte para datetime, retorna None se inválido"""
-            if pd.isna(val) or val is None:
+            if is_null_or_empty(val):
                 return None
             if isinstance(val, str):
                 try:
@@ -300,32 +340,41 @@ class AllCompanies(mongoengine.Document):
         
         def safe_convert_bool(val):
             """Converte para bool, retorna None se inválido"""
-            if pd.isna(val):
+            if is_null_or_empty(val):
                 return None
+            # Se for numpy array não vazio, pegar primeiro elemento
+            if isinstance(val, np.ndarray):
+                return bool(val[0]) if val.size > 0 else None
             return bool(val)
         
         def safe_convert_int(val):
             """Converte para int, retorna None se inválido"""
-            if pd.isna(val):
+            if is_null_or_empty(val):
                 return None
             try:
+                if isinstance(val, np.ndarray):
+                    return int(val[0]) if val.size > 0 else None
                 return int(val)
             except:
                 return None
         
         def safe_convert_float(val):
             """Converte para float, retorna None se inválido"""
-            if pd.isna(val):
+            if is_null_or_empty(val):
                 return None
             try:
+                if isinstance(val, np.ndarray):
+                    return float(val[0]) if val.size > 0 else None
                 return float(val)
             except:
                 return None
         
         def safe_convert_str(val):
             """Converte para string, retorna None se inválido"""
-            if pd.isna(val) or val is None:
+            if is_null_or_empty(val):
                 return None
+            if isinstance(val, np.ndarray):
+                return str(val[0]) if val.size > 0 else None
             return str(val)
         
         # Construir dicionário com todos os campos
