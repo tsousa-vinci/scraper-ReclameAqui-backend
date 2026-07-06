@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Activar log de debug para cron (aparte del log principal por fecha)
-exec > >(tee -a "/home/ubuntu/tsousa/scraper-reclameaqui-backend/cron-debug.log") 2>&1
+exec > >(tee -a "/home/tsousa/scraper-reclameaqui-backend/cron-debug.log") 2>&1
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') ==="
 echo "Inicio de ejecución del script desde: $0"
 
